@@ -8,6 +8,7 @@ import cv2
 import numpy as np
 from .imaging import Recipe
 from .dataset import stage_dataset, training_settings
+from .runtime import validate_runtime, symlink_free_engine_class
 
 
 def atomic_json(path, data):
@@ -17,7 +18,23 @@ def atomic_json(path, data):
     os.replace(temp,path)
 
 
+def calibration_values(raw, mask_path, required=False):
+    """Select only inspectable part pixels from a staged held-out tile."""
+    mask_path = Path(mask_path)
+    if mask_path.exists():
+        part_mask = cv2.imread(str(mask_path), cv2.IMREAD_GRAYSCALE)
+        if part_mask is None:
+            raise ValueError(f'Unreadable calibration part mask: {mask_path.name}')
+        valid = cv2.resize(part_mask, raw.shape[::-1], interpolation=cv2.INTER_NEAREST) > 0
+        return raw[valid]
+    if required:
+        raise ValueError(f'Missing calibration part mask: {mask_path.name}; rerun training')
+    return raw.ravel()
+
+
 def train(job):
+    runtime = validate_runtime()
+    print(f"Training runtime: Python {runtime['python']} — {runtime['executable']}", flush=True)
     root = Path(job['run']).resolve()
     recipe = Recipe(**job['recipe'])
     settings = training_settings(job)
@@ -34,7 +51,7 @@ def train(job):
     from lightning.pytorch.callbacks import Callback
     from anomalib.data import Folder
     from anomalib.models import EfficientAd, Patchcore
-    from anomalib.engine import Engine
+    Engine = symlink_free_engine_class()
     seed_everything(42,workers=True)
     torch.set_num_threads(min(8,os.cpu_count() or 1))
 
@@ -93,7 +110,12 @@ def train(job):
                 image = cv2.cvtColor(cv2.imread(str(p)),cv2.COLOR_BGR2RGB)
                 tensor = torch.from_numpy(image.copy()).permute(2,0,1).float().unsqueeze(0)/255
                 raw = model(tensor).anomaly_map.squeeze().numpy()
-                samples.append(raw.ravel()[::max(1,raw.size//4096)])
+                mask_path = root/'dataset_masks'/'validation'/p.name
+                values = calibration_values(raw, mask_path, required=recipe.green_background)
+                if values.size:
+                    samples.append(values[::max(1,values.size//4096)])
+        if not samples:
+            raise ValueError('No visible part pixels remain for model calibration')
         values = np.concatenate(samples)
         median,upper = np.quantile(values,[.5,.9995])
         if not np.isfinite(values).all() or upper-median<1e-9:

@@ -26,3 +26,20 @@ Additional validation:
 - The updated UI passed mocked-API Chromium checks for quick/normal payloads, budget values, button state, quick-model labeling, JavaScript errors, and mobile layout.
 
 These are regression and integration checks. Physical Windows/NVIDIA camera performance and real defect accuracy still require target-workstation validation.
+
+## Windows startup and green-backdrop part masking
+
+The supplied failure log reaches EfficientAD workspace creation, then fails with `WinError 1314` when anomalib requests a `latest` symbolic link. The application now uses anomalib's ordinary, non-versioned workspace inside each already-unique run folder. A regression test denies all symlink creation: stock anomalib reproduces the privilege failure and the application wrapper succeeds without that privilege.
+
+The supplied log also shows global Python 3.13. The pinned model stack supports Python 3.10–3.12; Windows install/start scripts now verify and use the local Python 3.11 environment. Worker runtime validation runs before dataset staging. PowerShell/Windows execution is not available in this Linux environment; the launchers were reviewed, not executed on Windows.
+
+Green masking is shared by training and inference. It neutralizes border-connected green, skips background-only tiles, saves per-tile masks, calibrates on part pixels only, and excludes background from final anomaly decisions. Isolated internal green-visible holes remain part pixels. Blank green views yield `NO_PART`, not `NORMAL`. The preview API can use either the camera or a dataset image.
+
+Validation completed:
+
+- **34 tests passed**, including the Windows privilege reproduction/fix, Python 3.13 early rejection, part-only calibration, background-score suppression, internal 13-pixel holes, native-resolution masked staging, `NO_PART`, preview API, and prior 4K sampling regressions.
+- Both real models trained and reloaded successfully with a synthetic 1024×1024 green-backed part, using 24 training tiles and six held-out tiles. Cached official pretrained weights and a synthetic test-only penalty-image fixture were used.
+- Full-frame prediction and simulated live HTTP inference passed. Changing only the excluded green backdrop's brightness left predictions unchanged. A synthetic enclosed green-visible hole changed the model maps, while all excluded background scores remained zero. This is an integration check, not real 1 mm dent/hole recall evidence.
+- Mocked-API Chromium tests passed for mask controls/defaults, recipe restoration, preview request/response/error handling, and mobile layout. JavaScript syntax and installed dependency checks passed.
+
+At the provided 298×165 mm field of view and 3840×2160 capture, 1 mm occupies approximately 13 camera pixels. New-job 256-pixel tiles preserve that nominal density at the model input; actual shallow-dent/blowhole sensitivity remains unmeasured until tested on real defect samples with the physical camera and lighting.

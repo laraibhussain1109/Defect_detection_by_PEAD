@@ -19,9 +19,9 @@ from pydantic import BaseModel, Field
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from .camera import Camera
-from .imaging import Recipe, overlay, prepare
+from .imaging import Recipe, overlay, prepare, preview_mask
 from .dataset import (DEFAULT_TRAIN_TILES, DEFAULT_VALIDATION_TILES, MAX_TRAIN_TILES,
-                      MAX_VALIDATION_TILES, training_settings)
+                      MAX_VALIDATION_TILES, EXTENSIONS, training_settings)
 from .train import atomic_json
 
 DATA = Path(os.environ.get('PEAD_DATA_DIR','data')).resolve()
@@ -265,8 +265,51 @@ class TrainingConfig(BaseModel):
     clahe: bool = False
     glare_level: int = 248
     max_glare: float = .02
-    tile_size: int = 512
-    min_area: int = 20
+    tile_size: int = 256
+    min_area: int = 4
+    green_background: bool = True
+    green_hue_low: int = 35
+    green_hue_high: int = 95
+    green_saturation_min: int = 60
+    green_value_min: int = 35
+    min_part_fraction: float = .02
+
+
+def recipe_from_config(config):
+    return Recipe(**config.model_dump(exclude={'dataset','epochs','coreset','train_tile_budget',
+                                              'validation_tile_budget','quick_check'}))
+
+
+@app.post('/api/recipe/preview')
+def recipe_preview(config: TrainingConfig):
+    try:
+        recipe = recipe_from_config(config)
+    except ValueError as exc:
+        raise HTTPException(422,str(exc)) from exc
+    frame,_ = camera.snapshot()
+    if frame is None:
+        dataset = Path(config.dataset).expanduser().resolve() if config.dataset else DATA/'captures'
+        if not dataset.is_dir():
+            raise HTTPException(422,'Dataset folder does not exist on this computer')
+        source = next((p for p in sorted(dataset.rglob('*')) if p.is_file() and p.suffix.lower() in EXTENSIONS),None)
+        if source is None:
+            raise HTTPException(409,'Connect the camera or select a folder containing an image to preview the part mask')
+        from PIL import Image
+        try:
+            with Image.open(source) as image:
+                if image.width*image.height>25_000_000:
+                    raise ValueError('Image exceeds 25 megapixels')
+            frame = cv2.imread(str(source))
+            if frame is None:
+                raise ValueError('Cannot decode the preview image')
+        except Exception as exc:
+            raise HTTPException(422,str(exc)) from exc
+    try:
+        preview,fraction = preview_mask(frame,recipe)
+    except ValueError as exc:
+        raise HTTPException(422,str(exc)) from exc
+    return Response(encode(preview),media_type='image/jpeg',
+                    headers={'Cache-Control':'no-store','X-Part-Fraction':str(fraction)})
 
 
 @app.post('/api/train')
@@ -278,8 +321,7 @@ def start_training(config: TrainingConfig):
         if importlib.util.find_spec('anomalib') is None:
             raise HTTPException(409,'ML dependencies missing. Follow the installation instructions in README.md.')
         try:
-            recipe = Recipe(**config.model_dump(exclude={'dataset','epochs','coreset','train_tile_budget',
-                                                        'validation_tile_budget','quick_check'}))
+            recipe = recipe_from_config(config)
             settings = training_settings(config.model_dump())
         except ValueError as exc:
             raise HTTPException(422,str(exc)) from exc

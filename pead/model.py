@@ -4,7 +4,7 @@ import os
 from pathlib import Path
 import cv2
 import numpy as np
-from .imaging import Recipe, prepare, tiles
+from .imaging import Recipe, prepare_with_mask, tiles
 
 
 class Hybrid:
@@ -33,11 +33,15 @@ class Hybrid:
     def predict(self, frame, cancel=None):
         if list(frame.shape[:2]) != self.meta['source_shape']:
             raise ValueError('Camera resolution differs from training; restore the trained capture profile or retrain')
-        image,glare,box = prepare(frame,self.recipe)
+        image,glare,box,part = prepare_with_mask(frame,self.recipe)
         fused = np.zeros(image.shape[:2],np.float32)
+        if part.mean() < self.recipe.min_part_fraction:
+            return fused,glare,box
         for (x,y,x1,y1),tile in tiles(image,self.recipe):
             if cancel is not None and cancel():
                 raise InterruptedError('Inspection stopped')
+            if part[y:y1,x:x1].mean() < self.recipe.min_part_fraction:
+                continue
             maps = self.tile_maps(tile)
             if cancel is not None and cancel():
                 raise InterruptedError('Inspection stopped')
@@ -50,4 +54,5 @@ class Hybrid:
             # Conservative OR fusion. A defect detected by either model survives.
             score = np.maximum(*normalized)
             fused[y:y1,x:x1] = np.maximum(fused[y:y1,x:x1],score)
+        fused[~part] = 0
         return fused,glare,box

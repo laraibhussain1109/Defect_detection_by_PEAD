@@ -7,7 +7,7 @@ import subprocess
 import sys
 import cv2
 import numpy as np
-from .imaging import Recipe, overlay
+from .imaging import Recipe, overlay, part_mask
 from .train import atomic_json
 
 
@@ -15,7 +15,8 @@ def main():
     parser=argparse.ArgumentParser()
     parser.add_argument('--directory',required=True)
     parser.add_argument('--verify-existing',action='store_true')
-    parser.add_argument('--image-size',type=int,choices=(256,512),default=256)
+    parser.add_argument('--image-size',type=int,choices=(256,512,1024),default=256)
+    parser.add_argument('--green-background',action='store_true')
     parser.add_argument('--train-tile-budget',type=int,default=512)
     parser.add_argument('--validation-tile-budget',type=int,default=128)
     parser.add_argument('--quick-check',action='store_true')
@@ -35,6 +36,11 @@ def main():
         cv2.line(image,(70,65),(185,65),(85,85,85),3)
         if args.image_size != 256:
             image=cv2.resize(image,(args.image_size,args.image_size))
+        if args.green_background:
+            margin=args.image_size//4
+            mask=np.zeros(image.shape[:2],np.uint8)
+            mask[margin:-margin,margin:-margin]=1
+            image[mask==0]=(25,155,25)
         cv2.imwrite(str(good/f'{i}.png'),image)
     # Test fixture only: sufficient for exercising the penalty-image dataloader,
     # explicitly not a substitute for the official ImageNette training dataset.
@@ -45,7 +51,7 @@ def main():
         cv2.imwrite(str(penalty/f'{i}.png'),image)
     run=base/'models'/'smoke'
     run.mkdir()
-    job={'dataset':str(good),'run':str(run),'recipe':Recipe(tile_size=256).dict(),'epochs':1,'coreset':.001,
+    job={'dataset':str(good),'run':str(run),'recipe':Recipe(tile_size=256,green_background=args.green_background,min_area=4).dict(),'epochs':1,'coreset':.001,
          'train_tile_budget':args.train_tile_budget,'validation_tile_budget':args.validation_tile_budget,
          'quick_check':args.quick_check}
     atomic_json(run/'job.json',job)
@@ -62,9 +68,20 @@ def verify(base):
     frame=cv2.imread(str(good/'0.png'))
     assert all(raw.shape==(256,256) for raw in hybrid.tile_maps(frame)), 'Both models must cover the full tile'
     normal,_,_=hybrid.predict(frame)
-    cv2.line(frame,(80,110),(175,160),(10,10,10),5)
+    if hybrid.recipe.green_background:
+        mask=part_mask(frame,hybrid.recipe)
+        changed=frame.copy()
+        changed[~mask]=(20,190,20)
+        unchanged,_,_=hybrid.predict(changed)
+        assert np.allclose(normal,unchanged), 'Green background brightness must not affect anomaly maps'
+        center=(frame.shape[1]//2,frame.shape[0]//2)
+        cv2.circle(frame,center,7,(25,155,25),-1)
+    else:
+        cv2.line(frame,(80,110),(175,160),(10,10,10),5)
     score,glare,box=hybrid.predict(frame)
     assert np.isfinite(score).all() and score.shape==frame.shape[:2]
+    if hybrid.recipe.green_background:
+        assert not score[~part_mask(frame,hybrid.recipe)].any(), 'Excluded background must have zero anomaly score'
     assert not np.allclose(normal,score), 'Changed pixels must affect predictions'
     image,result=overlay(frame,score,glare,box,hybrid.recipe)
     cv2.imwrite(str(base/'smoke-overlay.jpg'),image)

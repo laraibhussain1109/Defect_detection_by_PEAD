@@ -105,3 +105,23 @@ def test_status_labels_quick_check_model_even_before_loading_it(app):
     (run/'manifest.json').write_text(json.dumps({'quick_check':True}))
     (module.DATA/'models'/'active.json').write_text(json.dumps({'run':'quick'}))
     assert client.get('/api/status').json()['model_quick_check'] is True
+
+
+def test_part_preview_works_from_one_dataset_image_without_camera(app):
+    client,module=app
+    image=np.full((512,512,3),(25,155,25),np.uint8)
+    image[128:384,128:384]=130
+    cv2.imwrite(str(module.DATA/'captures'/'part.png'),image)
+    response=client.post('/api/recipe/preview',json={'green_background':True})
+    assert response.status_code==200,response.text
+    assert response.headers['content-type']=='image/jpeg'
+    assert float(response.headers['X-Part-Fraction'])==.25
+    preview=cv2.imdecode(np.frombuffer(response.content,np.uint8),cv2.IMREAD_COLOR)
+    assert preview.shape==(512,512,3)
+
+
+def test_mask_preview_needs_image_and_valid_green_bounds(app):
+    client,_=app
+    assert client.post('/api/recipe/preview',json={}).status_code==409
+    response=client.post('/api/recipe/preview',json={'green_hue_low':95,'green_hue_high':35})
+    assert response.status_code==422

@@ -6,7 +6,7 @@ import random
 import cv2
 from PIL import Image
 
-from .imaging import prepare, roi_box, tile_boxes
+from .imaging import crop, part_mask, prepare_with_mask, clipped_fraction, roi_box, tile_boxes
 
 EXTENSIONS = {'.png', '.jpg', '.jpeg', '.bmp', '.tif', '.tiff'}
 DEFAULT_TRAIN_TILES = 512
@@ -60,6 +60,31 @@ def select_tiles(source_count, tiles_per_source, budget, seed=42):
     return dict(sorted(selected.items()))
 
 
+def select_candidate_tiles(candidates, budget, seed=42):
+    """Balance across sources without ever selecting a background-only crop."""
+    if not candidates or any(not indices for indices in candidates):
+        raise ValueError('Each source must contain at least one part tile; check the ROI and green mask preview')
+    if all(indices == candidates[0] for indices in candidates):
+        selected = select_tiles(len(candidates), len(candidates[0]), budget, seed)
+        return {source: [candidates[source][index] for index in indices] for source, indices in selected.items()}
+    rng = random.Random(seed)
+    source_order = list(range(len(candidates)))
+    rng.shuffle(source_order)
+    pools = [list(indices) for indices in candidates]
+    for pool in pools:
+        rng.shuffle(pool)
+    selected = {}
+    used = 0
+    for round_index in range(max(map(len, pools))):
+        for source in source_order:
+            if used == budget:
+                return {key: sorted(value) for key, value in sorted(selected.items())}
+            if round_index < len(pools[source]):
+                selected.setdefault(source, []).append(pools[source][round_index])
+                used += 1
+    return {key: sorted(value) for key, value in sorted(selected.items())}
+
+
 def stage_dataset(root, dataset, recipe, train_budget=DEFAULT_TRAIN_TILES,
                   validation_budget=DEFAULT_VALIDATION_TILES, seed=42):
     root, dataset = Path(root), Path(dataset)
@@ -106,21 +131,46 @@ def stage_dataset(root, dataset, recipe, train_budget=DEFAULT_TRAIN_TILES,
     report = {'seed': seed, 'source_shape': source_shape, 'tiles_per_source': len(boxes), 'splits': {}}
     for name, paths in splits.items():
         budget = train_budget if name == 'normal' else validation_budget
-        selection = select_tiles(len(paths), len(boxes), budget, seed + (name == 'validation'))
+        candidates = []
+        if recipe.green_background:
+            print(f'{name}: locating the part and excluding green-background tiles...', flush=True)
+            for source_index, path in enumerate(paths):
+                frame = cv2.imread(str(path))
+                if frame is None or list(frame.shape[:2]) != source_shape:
+                    raise ValueError(f'Cannot decode image consistently: {path.name}')
+                image, _ = crop(frame, recipe)
+                mask = part_mask(image, recipe)
+                if mask.mean() < recipe.min_part_fraction:
+                    raise ValueError(f'No part found in {path.name}: check the ROI and green-background mask preview')
+                integral = cv2.integral(mask.astype('uint8'))
+                eligible = []
+                for index, (x,y,x1,y1) in enumerate(boxes):
+                    pixels = int(integral[y1,x1])-int(integral[y,x1])-int(integral[y1,x])+int(integral[y,x])
+                    if pixels / ((x1-x)*(y1-y)) >= recipe.min_part_fraction:
+                        eligible.append(index)
+                candidates.append(eligible)
+                if (source_index+1) % 25 == 0 or source_index+1 == len(paths):
+                    print(f'{name}: located part in {source_index+1}/{len(paths)} sources', flush=True)
+        else:
+            candidates = [list(range(len(boxes))) for _ in paths]
+        selection = select_candidate_tiles(candidates, budget, seed + (name == 'validation'))
         selected_count = sum(map(len, selection.values()))
-        total = len(paths) * len(boxes)
+        total = sum(map(len, candidates))
         print(f'{name}: staging {selected_count} / {total} tiles from '
               f'{len(selection)} / {len(paths)} sources (budget {budget}). '
-              'Inference still inspects every tile.', flush=True)
+              'Inference inspects every part tile.', flush=True)
         if len(selection) < len(paths):
             print(f'{name}: {len(paths)-len(selection)} sources are not sampled; '
                   'increase the tile budget or curate a smaller representative dataset for broader source coverage.', flush=True)
         target = root / 'dataset' / name
         target.mkdir(parents=True)
+        masks_target = root / 'dataset_masks' / name
+        if recipe.green_background:
+            masks_target.mkdir(parents=True)
         source_records = []
         for i, p in enumerate(paths):
             indices = selection.get(i, [])
-            source_records.append({'file': str(p), 'tiles': indices})
+            source_records.append({'file': str(p), 'tiles': indices,'eligible_tiles':len(candidates[i])})
             if not indices:
                 continue
             frame = cv2.imread(str(p))
@@ -128,8 +178,8 @@ def stage_dataset(root, dataset, recipe, train_budget=DEFAULT_TRAIN_TILES,
                 raise ValueError(f'Unreadable image: {p.name}')
             if list(frame.shape[:2]) != source_shape:
                 raise ValueError(f'Image dimensions changed or cannot be decoded consistently: {p.name}')
-            image, glare, _ = prepare(frame, recipe)
-            if glare.mean() > recipe.max_glare:
+            image, glare, _, mask = prepare_with_mask(frame, recipe)
+            if clipped_fraction(glare,mask) > recipe.max_glare:
                 raise ValueError(f'Excess glare in {p.name}; recapture under controlled lighting')
             for j in indices:
                 x, y, x1, y1 = boxes[j]
@@ -137,10 +187,14 @@ def stage_dataset(root, dataset, recipe, train_budget=DEFAULT_TRAIN_TILES,
                 tile = image[y:y1, x:x1]
                 if not cv2.imwrite(str(target / f'{i:05}_{j:03}.png'), tile):
                     raise OSError('Could not write staged training image')
+                if recipe.green_background:
+                    if not cv2.imwrite(str(masks_target / f'{i:05}_{j:03}.png'), mask[y:y1,x:x1].astype('uint8')*255):
+                        raise OSError('Could not write training part mask')
             print(f'{name}: staged source {i+1}/{len(paths)}', flush=True)
         report['splits'][name] = {
             'available_sources': len(paths), 'selected_sources': len(selection),
             'available_tiles': total, 'selected_tiles': selected_count,
+            'background_tiles_excluded':len(paths)*len(boxes)-total,
             'budget': budget, 'sources': source_records,
         }
     return report

@@ -13,6 +13,13 @@ class Recipe:
     tile_size: int = 512
     overlap: float = 0.25
     min_area: int = 20  # pixels in the cropped full-resolution ROI
+    # Off for legacy manifests; new UI recipes enable the green backdrop mask.
+    green_background: bool = False
+    green_hue_low: int = 35
+    green_hue_high: int = 95
+    green_saturation_min: int = 60
+    green_value_min: int = 35
+    min_part_fraction: float = 0.02
 
     def __post_init__(self):
         x, y, w, h = self.roi
@@ -22,6 +29,12 @@ class Recipe:
             raise ValueError('Invalid tile settings')
         if not 200 <= self.glare_level <= 255 or not 0 <= self.max_glare <= 1 or self.min_area < 1:
             raise ValueError('Invalid glare or area settings')
+        if not 0 <= self.green_hue_low < self.green_hue_high <= 179:
+            raise ValueError('Green hue bounds must satisfy 0 <= low < high <= 179')
+        if not 0 <= self.green_saturation_min <= 255 or not 0 <= self.green_value_min <= 255:
+            raise ValueError('Green saturation/value bounds must be between 0 and 255')
+        if not 0 < self.min_part_fraction <= 1:
+            raise ValueError('Minimum part fraction must be between 0 and 1')
 
     def dict(self):
         return asdict(self)
@@ -42,16 +55,60 @@ def crop(frame, recipe):
     return frame[y0:y1, x0:x1].copy(), (x0, y0, x1, y1)
 
 
-def prepare(frame, recipe):
+def part_mask(image, recipe):
+    """Keep non-background pixels, including enclosed holes/marks on the part.
+
+    Only chroma-key green connected to the ROI border is background. Removing
+    every green pixel would hide a new green-visible blowhole inside the part.
+    """
+    if not recipe.green_background:
+        return np.ones(image.shape[:2], dtype=bool)
+    hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
+    green = cv2.inRange(hsv, (recipe.green_hue_low, recipe.green_saturation_min, recipe.green_value_min),
+                       (recipe.green_hue_high, 255, 255))
+    count, labels = cv2.connectedComponents(green, connectivity=8)
+    border_labels = np.unique(np.concatenate((labels[0], labels[-1], labels[:,0], labels[:,-1])))
+    background = np.zeros(count, dtype=bool)
+    background[border_labels] = True
+    background[0] = False
+    return ~background[labels]
+
+
+def clipped_fraction(glare, part):
+    return float(np.count_nonzero(glare & part) / max(1, np.count_nonzero(part)))
+
+
+def prepare_with_mask(frame, recipe):
     image, box = crop(frame, recipe)
+    part = part_mask(image, recipe)
     # Detect clipping before normalization. Never inpaint or erase potential defects.
     glare = np.min(image, axis=2) >= recipe.glare_level
-    glare = cv2.dilate(glare.astype(np.uint8), np.ones((3,3), np.uint8)).astype(bool)
+    glare = cv2.dilate(glare.astype(np.uint8), np.ones((3,3), np.uint8)).astype(bool) & part
+    image[~part] = 127
     if recipe.clahe:
         lab = cv2.cvtColor(image, cv2.COLOR_BGR2LAB)
         lab[:,:,0] = cv2.createCLAHE(clipLimit=2, tileGridSize=(8,8)).apply(lab[:,:,0])
         image = cv2.cvtColor(lab, cv2.COLOR_LAB2BGR)
+        image[~part] = 127
+    return image, glare, box, part
+
+
+def prepare(frame, recipe):
+    image, glare, box, _ = prepare_with_mask(frame, recipe)
     return image, glare, box
+
+
+def preview_mask(frame, recipe):
+    cropped, box = crop(frame, recipe)
+    part = part_mask(cropped, recipe)
+    image = frame.copy()
+    x,y,x1,y1 = box
+    view = image[y:y1,x:x1]
+    view[~part] = (view[~part].astype(np.float32)*.25).astype(np.uint8)
+    contours,_ = cv2.findContours(part.astype(np.uint8), cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
+    cv2.drawContours(view,contours,-1,(0,220,255),2)
+    cv2.rectangle(image,(x,y),(x1-1,y1-1),(230,230,230),1)
+    return image, float(part.mean())
 
 
 def tile_boxes(shape, recipe):
@@ -90,16 +147,24 @@ def overlay(frame, score, glare, box, recipe):
     norm = np.clip(score,0,1)
     heat = cv2.applyColorMap((norm*255).astype(np.uint8), cv2.COLORMAP_JET)
     out = frame.copy()
-    out[y0:y1,x0:x1] = cv2.addWeighted(frame[y0:y1,x0:x1],.55,heat,.45,0)
-    out[y0:y1,x0:x1][glare] = (190,50,190)
+    part = part_mask(frame[y0:y1,x0:x1], recipe)
+    view = out[y0:y1,x0:x1]
+    blended = cv2.addWeighted(view,.55,heat,.45,0)
+    view[part] = blended[part]
+    view[glare & part] = (190,50,190)
     valid = score.copy()
-    valid[glare] = 0
+    valid[glare | ~part] = 0
     red = regions(valid,1.,recipe.min_area)
     yellow = regions(valid,.65,recipe.min_area)
     for items,color in [(yellow,(0,220,255)),(red,(0,0,255))]:
         for r in items:
             cv2.rectangle(out,(x0+r['x'],y0+r['y']),(x0+r['x']+r['width'],y0+r['y']+r['height']),color,2)
-    fraction = float(glare.mean())
-    state = 'UNINSPECTABLE' if fraction > recipe.max_glare else 'ANOMALY' if red else 'REVIEW' if yellow or fraction > 0 else 'NORMAL'
+    if recipe.green_background:
+        contours,_ = cv2.findContours(part.astype(np.uint8),cv2.RETR_EXTERNAL,cv2.CHAIN_APPROX_SIMPLE)
+        cv2.drawContours(view,contours,-1,(210,210,210),1)
+    fraction = clipped_fraction(glare, part)
+    part_fraction = float(part.mean())
+    state = 'NO_PART' if part_fraction < recipe.min_part_fraction else 'UNINSPECTABLE' if fraction > recipe.max_glare else 'ANOMALY' if red else 'REVIEW' if yellow or fraction > 0 else 'NORMAL'
     cv2.rectangle(out,(x0,y0),(x1-1,y1-1),(210,210,210),1)
-    return out, {'decision':state,'glare_fraction':fraction,'regions':red,'doubtful_regions':yellow,'score':float(valid.max()),'coordinate_space':'ROI pixels'}
+    return out, {'decision':state,'glare_fraction':fraction,'part_fraction':part_fraction,
+                 'regions':red,'doubtful_regions':yellow,'score':float(valid.max()),'coordinate_space':'ROI pixels'}
