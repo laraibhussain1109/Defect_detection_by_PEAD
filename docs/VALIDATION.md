@@ -77,3 +77,16 @@ Validation:
 - Python regressions also exercise the external model-assets override without moving dataset/run paths. Dependency consistency, JavaScript syntax, and whitespace checks passed.
 
 These are real PowerShell script-execution tests with controlled native-command fixtures and Windows-wheel path analysis. They do not claim an actual pip/CUDA installation on Windows or execution on the user's physical PC. The repair avoids the known long-path source rather than changing Windows registry policy.
+
+## Non-disruptive glare rejection
+
+Excessive-glare detection now excludes individual source images before the accepted sources are split or sampled. The worker logs rejected filenames and measured clipped fractions, preserves the original files, and saves accepted/rejected decisions to `quality.json`. The UI exposes the accepted and rejected counts. Accepted sources receive at least one tile in their assigned training or held-out calibration split; an effective budget grows when a requested budget would otherwise omit a source.
+
+Validation completed:
+
+- **51 tests passed**, covering the prior regressions plus automatic glare exclusion with green masking on/off, unchanged original PNGs, rejected images absent from both splits, a rejected first image with different resolution, all-accepted source coverage, insufficient/all-rejected summaries, and API quality counts.
+- The remaining minimum is checked after filtering. Both all-glare input and fewer-than-30-accepted input produce a saved count summary rather than aborting on the first excessive-glare image.
+- Actual EfficientAD and PatchCore CPU training completed on a mixed synthetic source folder with 30 accepted images and three excessive-glare PNGs. The accepted sources split into 24 training and six held-out sources. The three rejected images entered neither split, all 33 originals remained, calibration/checkpoint reload succeeded, and the run activated its model pair.
+- The updated UI passed mocked-API Chromium checks for accepted/rejected/duplicate counts, zero and missing summaries, running-state controls, and mobile layout. JavaScript syntax and whitespace checks passed.
+
+The automatic exclusion in this change applies to excessive glare using the recipe's existing limit. Unreadable images, missing parts, mixed accepted resolutions, and source files modified during staging remain separately diagnosed errors. Live-camera glare decisions and the minimum of 30 accepted distinct source images are unchanged.

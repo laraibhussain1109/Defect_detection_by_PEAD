@@ -125,3 +125,16 @@ def test_mask_preview_needs_image_and_valid_green_bounds(app):
     assert client.post('/api/recipe/preview',json={}).status_code==409
     response=client.post('/api/recipe/preview',json={'green_hue_low':95,'green_hue_high':35})
     assert response.status_code==422
+
+
+def test_training_status_exposes_accepted_and_rejected_counts(app,monkeypatch):
+    import json
+    client,module=app
+    run=module.DATA/'models'/'quality-test';run.mkdir()
+    summary={'scanned_files':33,'distinct_sources':33,'accepted_sources':30,'rejected_sources':3,'duplicate_files':0}
+    (run/'quality.json').write_text(json.dumps({**summary,'rejected':[{'file':'a.png'}]}))
+    (run/'result.json').write_text(json.dumps({'state':'complete'}))
+    module.current_run=run
+    assert client.get('/api/status').json()['training']['quality']==summary
+    (run/'result.json').write_text(json.dumps({'state':'failed','error':'insufficient accepted images'}))
+    assert client.get('/api/status').json()['training']['quality']==summary

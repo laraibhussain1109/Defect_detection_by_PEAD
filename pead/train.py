@@ -130,6 +130,7 @@ def train(job):
     manifest = {'format':2,'runtime':runtime,'recipe':recipe.dict(),'source_shape':source_shape,'calibration':calibration,'normal_sources':source_splits['normal']['available_sources'],
                 'validation_sources':source_splits['validation']['available_sources'],'epochs':settings['epochs'],
                 'quick_check':settings['quick_check'],
+                'quality':sampling['quality'],
                 'tile_sampling':{name:{key:value for key,value in split.items() if key!='sources'}
                                  for name,split in source_splits.items()},'models':['EfficientAd-small','Patchcore-resnet18'],
                 'threshold_note':'Normal-only pixel quantiles; validate with real defects before production acceptance.'}

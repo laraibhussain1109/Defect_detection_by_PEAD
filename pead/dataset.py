@@ -1,12 +1,15 @@
 """Bounded, source-separated staging for high-resolution normal-image datasets."""
+from dataclasses import replace
 import hashlib
+import json
+import os
 from pathlib import Path
 import random
 
 import cv2
 from PIL import Image
 
-from .imaging import crop, part_mask, prepare_with_mask, clipped_fraction, roi_box, tile_boxes
+from .imaging import prepare_with_mask, clipped_fraction, roi_box, tile_boxes
 
 EXTENSIONS = {'.png', '.jpg', '.jpeg', '.bmp', '.tif', '.tiff'}
 DEFAULT_TRAIN_TILES = 512
@@ -85,6 +88,14 @@ def select_candidate_tiles(candidates, budget, seed=42):
     return {key: sorted(value) for key, value in sorted(selected.items())}
 
 
+def write_quality_report(root, report):
+    root = Path(root)
+    root.mkdir(parents=True, exist_ok=True)
+    temporary = root/'quality.tmp'
+    temporary.write_text(json.dumps(report, indent=2), encoding='utf-8')
+    os.replace(temporary, root/'quality.json')
+
+
 def stage_dataset(root, dataset, recipe, train_budget=DEFAULT_TRAIN_TILES,
                   validation_budget=DEFAULT_VALIDATION_TILES, seed=42):
     root, dataset = Path(root), Path(dataset)
@@ -93,17 +104,17 @@ def stage_dataset(root, dataset, recipe, train_budget=DEFAULT_TRAIN_TILES,
         raise ValueError('Maximum 2000 source images per run; curate a representative dataset first')
     print(f'Scanning and deduplicating {len(files)} source images...', flush=True)
     unique = {}
-    source_shape = None
+    duplicates = []
     for file_index, p in enumerate(files):
         if file_index and file_index % 100 == 0:
             print(f'Scanned {file_index}/{len(files)} source images', flush=True)
-        # Read bounded chunks rather than allocating an entire encoded 4K image.
         digest = hashlib.sha256()
         with p.open('rb') as stream:
             for block in iter(lambda: stream.read(1024 * 1024), b''):
                 digest.update(block)
         key = digest.hexdigest()
         if key in unique:
+            duplicates.append({'file':str(p),'duplicate_of':str(unique[key][0])})
             continue
         try:
             with Image.open(p) as image:
@@ -113,88 +124,118 @@ def stage_dataset(root, dataset, recipe, train_budget=DEFAULT_TRAIN_TILES,
                 image.verify()
         except Exception as exc:
             raise ValueError(f'Unreadable image {p.name}: {exc}') from exc
+        unique[key] = (p, shape)
+
+    # Assess every distinct source BEFORE assigning a train/holdout split or
+    # spending the tile budget. Rejected frames never enter either dataset.
+    source_shape = None
+    boxes = None
+    accepted = {}
+    rejected = []
+    quality_recipe = replace(recipe, clahe=False)
+    print(f'Checking glare and visible part in {len(unique)} distinct images...', flush=True)
+    for source_index, (path, header_shape) in enumerate(unique.values()):
+        frame = cv2.imread(str(path))
+        if frame is None or list(frame.shape[:2]) != header_shape:
+            raise ValueError(f'Cannot decode image consistently: {path.name}')
+        _, glare, _, mask = prepare_with_mask(frame, quality_recipe)
+        fraction = clipped_fraction(glare, mask)
+        if fraction > recipe.max_glare:
+            rejected.append({'file':str(path),'reason':'excess_glare','glare_fraction':fraction,
+                             'limit':recipe.max_glare})
+            print(f'REJECTED glare: {path.name} ({fraction:.2%} > {recipe.max_glare:.2%}); '
+                  'skipping image, original preserved', flush=True)
+            continue
+        if mask.mean() < recipe.min_part_fraction:
+            raise ValueError(f'No part found in {path.name}: check the ROI and green-background mask preview')
         if source_shape is None:
-            source_shape = shape
-        if shape != source_shape:
-            raise ValueError('All source images must have the same camera resolution')
-        unique[key] = p
-    files = list(unique.values())
-    if len(files) < 30:
-        raise ValueError('At least 30 distinct good images are required (100–500 recommended)')
-    random.Random(seed).shuffle(files)
-    nval = max(6, len(files) // 5)
-    splits = {'normal': files[nval:], 'validation': files[:nval]}
-    x0, y0, x1, y1 = roi_box(source_shape, recipe)
-    boxes = list(tile_boxes((y1-y0, x1-x0), recipe))
-    print(f'Dataset: {len(files)} distinct source images; {source_shape[1]} x {source_shape[0]}; '
-          f'{len(boxes)} native-resolution tiles per image', flush=True)
-    report = {'seed': seed, 'source_shape': source_shape, 'tiles_per_source': len(boxes), 'splits': {}}
-    for name, paths in splits.items():
-        budget = train_budget if name == 'normal' else validation_budget
-        candidates = []
+            source_shape = header_shape
+            x0,y0,x1,y1 = roi_box(source_shape,recipe)
+            boxes = list(tile_boxes((y1-y0,x1-x0),recipe))
+        elif header_shape != source_shape:
+            raise ValueError('All accepted source images must have the same camera resolution')
         if recipe.green_background:
-            print(f'{name}: locating the part and excluding green-background tiles...', flush=True)
-            for source_index, path in enumerate(paths):
-                frame = cv2.imread(str(path))
-                if frame is None or list(frame.shape[:2]) != source_shape:
-                    raise ValueError(f'Cannot decode image consistently: {path.name}')
-                image, _ = crop(frame, recipe)
-                mask = part_mask(image, recipe)
-                if mask.mean() < recipe.min_part_fraction:
-                    raise ValueError(f'No part found in {path.name}: check the ROI and green-background mask preview')
-                integral = cv2.integral(mask.astype('uint8'))
-                eligible = []
-                for index, (x,y,x1,y1) in enumerate(boxes):
-                    pixels = int(integral[y1,x1])-int(integral[y,x1])-int(integral[y1,x])+int(integral[y,x])
-                    if pixels / ((x1-x)*(y1-y)) >= recipe.min_part_fraction:
-                        eligible.append(index)
-                candidates.append(eligible)
-                if (source_index+1) % 25 == 0 or source_index+1 == len(paths):
-                    print(f'{name}: located part in {source_index+1}/{len(paths)} sources', flush=True)
+            integral = cv2.integral(mask.astype('uint8'))
+            eligible = []
+            for index,(x,y,x1,y1) in enumerate(boxes):
+                pixels = int(integral[y1,x1])-int(integral[y,x1])-int(integral[y1,x])+int(integral[y,x])
+                if pixels / ((x1-x)*(y1-y)) >= recipe.min_part_fraction:
+                    eligible.append(index)
+            if not eligible:
+                raise ValueError(f'No usable part tiles in {path.name}: check the ROI and green mask preview')
         else:
-            candidates = [list(range(len(boxes))) for _ in paths]
-        selection = select_candidate_tiles(candidates, budget, seed + (name == 'validation'))
-        selected_count = sum(map(len, selection.values()))
-        total = sum(map(len, candidates))
+            eligible = list(range(len(boxes)))
+        stat = path.stat()
+        accepted[path] = {'tiles':eligible,'glare_fraction':fraction,
+                          'size':stat.st_size,'mtime_ns':stat.st_mtime_ns}
+        if (source_index+1) % 25 == 0 or source_index+1 == len(unique):
+            print(f'Quality checked {source_index+1}/{len(unique)} distinct sources; '
+                  f'accepted {len(accepted)}, rejected {len(rejected)} glare', flush=True)
+    summary = {'scanned_files':len(files),'distinct_sources':len(unique),
+               'accepted_sources':len(accepted),'rejected_sources':len(rejected),
+               'duplicate_files':len(duplicates)}
+    quality = {**summary,'glare_limit':recipe.max_glare,'rejected':rejected,'duplicates':duplicates,
+               'accepted':[{'file':str(path),'glare_fraction':item['glare_fraction']} for path,item in accepted.items()]}
+    write_quality_report(root,quality)
+    print(f'Quality summary: {len(accepted)} accepted, {len(rejected)} glare-rejected, '
+          f'{len(duplicates)} duplicate files excluded. Source files are unchanged.', flush=True)
+    if len(accepted) < 30:
+        raise ValueError(f'Insufficient accepted images after quality filtering: {len(accepted)} accepted, '
+                         f'{len(rejected)} rejected for glare, {len(duplicates)} duplicates. '
+                         'At least 30 distinct accepted good images are required; see quality.json.')
+
+    paths = list(accepted)
+    random.Random(seed).shuffle(paths)
+    nval = max(6,len(paths)//5)
+    splits = {'normal':paths[nval:],'validation':paths[:nval]}
+    print(f'Dataset: {len(paths)} accepted distinct sources; {source_shape[1]} x {source_shape[0]}; '
+          f'{len(boxes)} native-resolution grid tiles per image', flush=True)
+    report = {'seed':seed,'source_shape':source_shape,'tiles_per_source':len(boxes),
+              'quality':summary,'splits':{}}
+    for name, paths in splits.items():
+        requested_budget = train_budget if name == 'normal' else validation_budget
+        # A tile limit must not silently drop an accepted source. Preserve
+        # bounded per-image sampling, with at least one crop per source.
+        budget = max(requested_budget,len(paths))
+        if budget > requested_budget:
+            print(f'{name}: increasing tile budget {requested_budget} -> {budget} '
+                  'to include every accepted source', flush=True)
+        candidates = [accepted[path]['tiles'] for path in paths]
+        selection = select_candidate_tiles(candidates,budget,seed+(name=='validation'))
+        selected_count = sum(map(len,selection.values()))
+        total = sum(map(len,candidates))
         print(f'{name}: staging {selected_count} / {total} tiles from '
-              f'{len(selection)} / {len(paths)} sources (budget {budget}). '
+              f'{len(selection)} / {len(paths)} accepted sources (effective budget {budget}). '
               'Inference inspects every part tile.', flush=True)
-        if len(selection) < len(paths):
-            print(f'{name}: {len(paths)-len(selection)} sources are not sampled; '
-                  'increase the tile budget or curate a smaller representative dataset for broader source coverage.', flush=True)
-        target = root / 'dataset' / name
+        target = root/'dataset'/name
         target.mkdir(parents=True)
-        masks_target = root / 'dataset_masks' / name
+        masks_target = root/'dataset_masks'/name
         if recipe.green_background:
             masks_target.mkdir(parents=True)
-        source_records = []
-        for i, p in enumerate(paths):
-            indices = selection.get(i, [])
-            source_records.append({'file': str(p), 'tiles': indices,'eligible_tiles':len(candidates[i])})
-            if not indices:
-                continue
-            frame = cv2.imread(str(p))
-            if frame is None:
-                raise ValueError(f'Unreadable image: {p.name}')
-            if list(frame.shape[:2]) != source_shape:
-                raise ValueError(f'Image dimensions changed or cannot be decoded consistently: {p.name}')
-            image, glare, _, mask = prepare_with_mask(frame, recipe)
-            if clipped_fraction(glare,mask) > recipe.max_glare:
-                raise ValueError(f'Excess glare in {p.name}; recapture under controlled lighting')
+        records = []
+        for i,path in enumerate(paths):
+            indices = selection[i]
+            records.append({'file':str(path),'tiles':indices,'eligible_tiles':len(candidates[i])})
+            # Captures are unique files. Detect in-place edits rather than
+            # training on different pixels from those that passed preflight.
+            current = path.stat()
+            previous = accepted[path]
+            if current.st_size != previous['size'] or current.st_mtime_ns != previous['mtime_ns']:
+                raise ValueError(f'Image changed after quality filtering: {path.name}; keep the source folder unchanged and rerun')
+            frame = cv2.imread(str(path))
+            if frame is None or list(frame.shape[:2]) != source_shape:
+                raise ValueError(f'Cannot decode accepted image consistently: {path.name}')
+            image,_,_,mask = prepare_with_mask(frame,recipe)
             for j in indices:
-                x, y, x1, y1 = boxes[j]
-                # Preserve native resolution: sample crops, never resize whole 4K images.
-                tile = image[y:y1, x:x1]
-                if not cv2.imwrite(str(target / f'{i:05}_{j:03}.png'), tile):
+                x,y,x1,y1 = boxes[j]
+                if not cv2.imwrite(str(target/f'{i:05}_{j:03}.png'),image[y:y1,x:x1]):
                     raise OSError('Could not write staged training image')
                 if recipe.green_background:
-                    if not cv2.imwrite(str(masks_target / f'{i:05}_{j:03}.png'), mask[y:y1,x:x1].astype('uint8')*255):
+                    if not cv2.imwrite(str(masks_target/f'{i:05}_{j:03}.png'),mask[y:y1,x:x1].astype('uint8')*255):
                         raise OSError('Could not write training part mask')
-            print(f'{name}: staged source {i+1}/{len(paths)}', flush=True)
-        report['splits'][name] = {
-            'available_sources': len(paths), 'selected_sources': len(selection),
-            'available_tiles': total, 'selected_tiles': selected_count,
+            print(f'{name}: staged accepted source {i+1}/{len(paths)}',flush=True)
+        report['splits'][name] = {'available_sources':len(paths),'selected_sources':len(selection),
+            'available_tiles':total,'selected_tiles':selected_count,
             'background_tiles_excluded':len(paths)*len(boxes)-total,
-            'budget': budget, 'sources': source_records,
-        }
+            'budget':requested_budget,'effective_budget':budget,'sources':records}
     return report

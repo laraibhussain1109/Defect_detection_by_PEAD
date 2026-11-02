@@ -200,12 +200,18 @@ def status():
 def job_status():
     if current_run is None:
         return {'state':'idle'}
+    quality_path = current_run/'quality.json'
+    extra = {}
+    if quality_path.exists():
+        quality = json.loads(quality_path.read_text(encoding='utf-8'))
+        extra['quality'] = {key:quality[key] for key in ('scanned_files','distinct_sources',
+            'accepted_sources','rejected_sources','duplicate_files')}
     result = current_run/'result.json'
     if training_active():
-        return {'state':'running','run':current_run.name}
+        return {'state':'running','run':current_run.name,**extra}
     if result.exists():
-        return {**json.loads(result.read_text()),'run':current_run.name}
-    return {'state':'failed','error':'Training process exited; inspect the log','run':current_run.name}
+        return {**json.loads(result.read_text()),'run':current_run.name,**extra}
+    return {'state':'failed','error':'Training process exited; inspect the log','run':current_run.name,**extra}
 
 
 @app.get('/api/frame')
