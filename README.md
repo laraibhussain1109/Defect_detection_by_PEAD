@@ -4,7 +4,7 @@ A local Windows-first workstation combining **official anomalib EfficientAD-smal
 
 ## Windows + NVIDIA installation
 
-Install **Python 3.11 x64**, an up-to-date NVIDIA driver supporting CUDA 12.1, and Git. A CUDA toolkit installation is not required for the PyTorch wheels. Use an NVIDIA GPU with at least 8 GB VRAM as a starting point; memory and speed depend on dataset, tile count, and PatchCore coreset size.
+Install standard **Python 3.13 x64** (Python 3.12 and 3.11 are also supported), an up-to-date NVIDIA driver supporting CUDA 12.6, and Git. Use the regular Python build, not the free-threaded or 32-bit variant. A CUDA toolkit installation is not required for the PyTorch wheels. Use an NVIDIA GPU with at least 8 GB VRAM as a starting point; memory and speed depend on dataset, tile count, and PatchCore coreset size.
 
 From PowerShell in this repository:
 
@@ -18,19 +18,29 @@ Open the local application at `http://127.0.0.1:8000` on that same computer. Kee
 For CPU development on Linux:
 
 ```bash
-python3 -m venv .venv
-.venv/bin/pip install torch==2.5.1 torchvision==0.20.1 --index-url https://download.pytorch.org/whl/cpu
+python3.13 -m venv .venv
+.venv/bin/pip install torch==2.10.0 torchvision==0.25.0 --index-url https://download.pytorch.org/whl/cpu
 .venv/bin/pip install -e '.[ml,dev]'
 .venv/bin/python -m uvicorn pead.app:app --host 127.0.0.1 --port 8000
 ```
 
-Python 3.10–3.12 is supported. First training needs Internet for EfficientAD teacher weights (GitHub release), hash-checked PatchCore backbone weights (PyTorch), and the official ImageNette penalty dataset (`s3.amazonaws.com`, about 1.5 GB). Dependencies use PyPI. All downloads retain TLS and upstream verification. Training errors appear in the UI log; a failed run does not replace the active model.
+Python **3.11–3.13** is supported. Version 0.2 uses anomalib 2.7.0, PyTorch 2.10.0, torchvision 0.25.0, and NumPy 2.2 or newer; OpenVINO is not required for these two models. First training needs Internet for EfficientAD teacher weights (GitHub release), hash-checked PatchCore backbone weights (PyTorch), and the official ImageNette penalty dataset (`s3.amazonaws.com`, about 1.5 GB). Dependencies use PyPI. All downloads retain TLS and upstream verification. Training errors appear in the UI log; a failed run does not replace the active model.
 
-## Windows training error and supported interpreter
+## Updating an existing installation
 
 `WinError 1314` in anomalib's workspace setup was caused by a directory symlink requiring a Windows privilege. Training now uses ordinary run-specific directories and does not require administrator rights or Developer Mode for symlinks.
 
-Use the provided installation and startup scripts. Python **3.13 is unsupported** by this pinned model stack. A traceback under `Python313/Lib/site-packages` means the application was started using that global interpreter rather than the prepared environment. Run `scripts/install-windows.ps1` with Python3.11 installed, then `scripts/start.ps1`; the launcher checks the local virtual environment and dependency versions. An incompatible existing `.venv` is preserved as a backup before a supported environment is created. Keep your `data` folder and source images.
+Python **3.13 is supported** by the updated stack; no Python 3.11 downgrade is needed. Stop the app, replace the application files while keeping your `data` folder and source images, then rerun the installation and startup commands above. The installer prefers `py -3.13`, then Python 3.12 or 3.11, with a supported `python` on PATH as a fallback. It creates the project `.venv` instead of modifying global packages. An incompatible old environment is preserved in a `.venv-backup-*` folder. The launcher validates the local interpreter and pinned core dependencies before startup.
+
+The installer normally installs the CUDA 12.6 PyTorch wheels. For a CPU-only workstation, use:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts/install-windows.ps1 -Cpu
+```
+
+To rebuild an existing environment explicitly, add `-Recreate`; this preserves the old `.venv` as a backup. Neither option deletes datasets or model caches.
+
+Version 0.2 writes checkpoint format 2 with plain component configuration and uses `weights_only=True` when loading. **Retrain models saved by earlier releases** before using them with this version: older format-1 checkpoints are rejected with a retraining message. Your good images remain usable. Keep the old run folders if you need to retain the previous artifacts; a newly verified run activates its own model pair.
 
 ## Operator workflow
 

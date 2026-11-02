@@ -14,13 +14,16 @@ class Hybrid:
         self.torch = torch
         self.directory = Path(directory)
         self.meta = json.loads((self.directory/'manifest.json').read_text())
+        if self.meta.get('format',1) < 2:
+            raise ValueError('This model uses the older checkpoint format. Retrain with this application version; '
+                             'your source images are unchanged.')
         self.recipe = Recipe(**self.meta['recipe'])
         self.device = device or ('cuda' if torch.cuda.is_available() else 'cpu')
         if self.device=='cpu':
             torch.set_num_threads(min(4,os.cpu_count() or 1))
         # Checkpoints are locally generated trusted artifacts, never user uploads.
-        self.models = [EfficientAd.load_from_checkpoint(self.directory/'efficientad.ckpt',map_location='cpu'),
-                       Patchcore.load_from_checkpoint(self.directory/'patchcore.ckpt',map_location='cpu',pre_trained=False)]
+        self.models = [EfficientAd.load_from_checkpoint(self.directory/'efficientad.ckpt',map_location='cpu',weights_only=True),
+                       Patchcore.load_from_checkpoint(self.directory/'patchcore.ckpt',map_location='cpu',pre_trained=False,weights_only=True)]
         for model in self.models:
             model.to(self.device).eval()
 

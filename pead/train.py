@@ -93,10 +93,10 @@ def train(job):
         engine.fit(model=model,datamodule=dm)
         engine.trainer.save_checkpoint(root/name)
         model.cpu().eval()
-        # anomalib retains collected PatchCore embeddings after coreset fitting.
-        # They are plain-list tensors and are not moved by .cpu().
+        # The modern PatchCore model owns its transient embedding store. Keep
+        # those plain-list tensors from retaining accelerator memory.
         if isinstance(model, Patchcore):
-            model.embeddings.clear()
+            model.model.embedding_store.clear()
         del engine, dm
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
@@ -121,7 +121,7 @@ def train(job):
         if not np.isfinite(values).all() or upper-median<1e-9:
             raise ValueError('Degenerate calibration: model maps do not distinguish normal variation')
         calibration.append({'median':float(median),'upper':float(upper)})
-    manifest = {'format':1,'recipe':recipe.dict(),'source_shape':source_shape,'calibration':calibration,'normal_sources':source_splits['normal']['available_sources'],
+    manifest = {'format':2,'runtime':runtime,'recipe':recipe.dict(),'source_shape':source_shape,'calibration':calibration,'normal_sources':source_splits['normal']['available_sources'],
                 'validation_sources':source_splits['validation']['available_sources'],'epochs':settings['epochs'],
                 'quick_check':settings['quick_check'],
                 'tile_sampling':{name:{key:value for key,value in split.items() if key!='sources'}

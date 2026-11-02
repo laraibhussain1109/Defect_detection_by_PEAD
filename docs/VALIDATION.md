@@ -27,7 +27,7 @@ Additional validation:
 
 These are regression and integration checks. Physical Windows/NVIDIA camera performance and real defect accuracy still require target-workstation validation.
 
-## Windows startup and green-backdrop part masking
+## Windows startup and green-backdrop part masking (0.1.x)
 
 The supplied failure log reaches EfficientAD workspace creation, then fails with `WinError 1314` when anomalib requests a `latest` symbolic link. The application now uses anomalib's ordinary, non-versioned workspace inside each already-unique run folder. A regression test denies all symlink creation: stock anomalib reproduces the privilege failure and the application wrapper succeeds without that privilege.
 
@@ -43,3 +43,19 @@ Validation completed:
 - Mocked-API Chromium tests passed for mask controls/defaults, recipe restoration, preview request/response/error handling, and mobile layout. JavaScript syntax and installed dependency checks passed.
 
 At the provided 298×165 mm field of view and 3840×2160 capture, 1 mm occupies approximately 13 camera pixels. New-job 256-pixel tiles preserve that nominal density at the model input; actual shallow-dent/blowhole sensitivity remains unmeasured until tested on real defect samples with the physical camera and lighting.
+
+
+## Python 3.13 support (0.2.0)
+
+This release supersedes the earlier Python 3.13 restriction. The dependency stack was migrated, not just the interpreter guard: anomalib 2.7.0, PyTorch 2.10.0, torchvision 0.25.0, and NumPy 2.x. The outdated mandatory OpenVINO dependency was removed. The Windows installer now prefers the existing standard 64-bit Python 3.13, with supported 3.12/3.11 fallback, and installs the matching CUDA 12.6 or optional CPU wheels.
+
+Validated in a clean **CPython 3.13.16** environment:
+
+- Fresh dependency installation completed, actual EfficientAD/PatchCore imports passed without OpenVINO, and `pip check` reported no broken requirements.
+- **42 tests passed**, including Python 3.13 acceptance, old-stack diagnostics, symlink-free workspace setup, CPU/CUDA build tags, Windows interpreter-build checks, all part-mask and 4K sampling regressions, and safe rejection of legacy checkpoints before pickle loading.
+- Both official models completed actual CPU training on the isolated green-background synthetic fixture (24 training / six held-out tiles), calibrated on part pixels, saved new-format checkpoints, and reloaded them with `weights_only=True`.
+- Full-frame tiled inference and simulated live HTTP inspection passed. Excluded-background brightness changes left maps unchanged; a synthetic enclosed hole changed predictions; ignored-background scores remained zero. The live loop stopped cleanly.
+- Exact official **Windows CPython 3.13 CUDA 12.6 wheels** for torch 2.10.0 and torchvision 0.25.0 downloaded successfully. This verifies binary availability, not execution on a physical NVIDIA device.
+- JavaScript syntax and whitespace checks passed. PowerShell scripts were reviewed, not executed on Windows; physical Windows/CUDA/camera behavior and real defect recall remain target-workstation checks.
+
+Checkpoint format 2 uses the updated stack's safe plain-data component configuration. Format 1 model files are retained but require retraining; dataset/source images are not modified or removed. The synthetic penalty-image fixture is test-only, as in prior integration checks.
