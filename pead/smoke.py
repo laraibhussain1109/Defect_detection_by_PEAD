@@ -15,6 +15,10 @@ def main():
     parser=argparse.ArgumentParser()
     parser.add_argument('--directory',required=True)
     parser.add_argument('--verify-existing',action='store_true')
+    parser.add_argument('--image-size',type=int,choices=(256,512),default=256)
+    parser.add_argument('--train-tile-budget',type=int,default=512)
+    parser.add_argument('--validation-tile-budget',type=int,default=128)
+    parser.add_argument('--quick-check',action='store_true')
     args=parser.parse_args()
     base=Path(args.directory).resolve()
     if args.verify_existing:
@@ -29,6 +33,8 @@ def main():
         image=np.clip(rng.normal(115,3,(256,256,3)),0,240).astype(np.uint8)
         cv2.circle(image,(128,128),65,(145+i%4,)*3,-1)
         cv2.line(image,(70,65),(185,65),(85,85,85),3)
+        if args.image_size != 256:
+            image=cv2.resize(image,(args.image_size,args.image_size))
         cv2.imwrite(str(good/f'{i}.png'),image)
     # Test fixture only: sufficient for exercising the penalty-image dataloader,
     # explicitly not a substitute for the official ImageNette training dataset.
@@ -39,14 +45,17 @@ def main():
         cv2.imwrite(str(penalty/f'{i}.png'),image)
     run=base/'models'/'smoke'
     run.mkdir()
-    job={'dataset':str(good),'run':str(run),'recipe':Recipe(tile_size=256).dict(),'epochs':1,'coreset':.001}
+    job={'dataset':str(good),'run':str(run),'recipe':Recipe(tile_size=256).dict(),'epochs':1,'coreset':.001,
+         'train_tile_budget':args.train_tile_budget,'validation_tile_budget':args.validation_tile_budget,
+         'quick_check':args.quick_check}
     atomic_json(run/'job.json',job)
     subprocess.run([sys.executable,'-m','pead.train',str(run/'job.json')],check=True)
     verify(base)
 
 
 def verify(base):
-    run=base/'models'/'smoke'
+    active=json.loads((base/'models'/'active.json').read_text())
+    run=base/'models'/active['run']
     good=base/'good'
     from .model import Hybrid
     hybrid=Hybrid(run,device='cpu')
@@ -77,6 +86,7 @@ def verify(base):
             assert not status['error'],status['error']
             time.sleep(.2)
         assert status['result'], 'Live inference did not produce a result'
+        assert status['model_quick_check']==hybrid.meta.get('quick_check',False)
         assert client.get('/api/frame').headers['content-type']=='image/jpeg'
         assert client.post('/api/inspection/stop').status_code==200
         assert client.get('/api/status').json()['result'] is None

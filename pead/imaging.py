@@ -27,13 +27,18 @@ class Recipe:
         return asdict(self)
 
 
-def crop(frame, recipe):
-    h, w = frame.shape[:2]
+def roi_box(shape, recipe):
+    h, w = shape[:2]
     x, y, rw, rh = recipe.roi
     x0, y0 = int(x*w), int(y*h)
     x1, y1 = min(w, int((x+rw)*w)), min(h, int((y+rh)*h))
     if x1 <= x0 or y1 <= y0:
         raise ValueError('ROI is empty at this image resolution')
+    return x0, y0, x1, y1
+
+
+def crop(frame, recipe):
+    x0, y0, x1, y1 = roi_box(frame.shape, recipe)
     return frame[y0:y1, x0:x1].copy(), (x0, y0, x1, y1)
 
 
@@ -49,19 +54,23 @@ def prepare(frame, recipe):
     return image, glare, box
 
 
-def tiles(image, recipe):
-    h, w = image.shape[:2]
+def tile_boxes(shape, recipe):
+    """Plan native-resolution crops without decoding or copying image pixels."""
+    h, w = shape[:2]
     size = recipe.tile_size
     def positions(length):
         if length <= size:
             return [0]
         return sorted(set([*range(0, length-size+1, int(size*(1-recipe.overlap))), length-size]))
     xs, ys = positions(w), positions(h)
-    if len(xs)*len(ys) > 128:
-        raise ValueError('ROI exceeds 128 tiles; crop ROI or increase tile size')
     for y in ys:
         for x in xs:
-            yield (x,y,min(x+size,w),min(y+size,h)), image[y:y+size,x:x+size]
+            yield x,y,min(x+size,w),min(y+size,h)
+
+
+def tiles(image, recipe):
+    for x,y,x1,y1 in tile_boxes(image.shape, recipe):
+        yield (x,y,x1,y1), image[y:y1,x:x1]
 
 
 def regions(score, threshold, min_area):

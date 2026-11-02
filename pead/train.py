@@ -1,14 +1,13 @@
 """Isolated training process; only publishes a complete model pair."""
 import argparse
-import hashlib
 import json
 import os
 from pathlib import Path
-import random
 import traceback
 import cv2
 import numpy as np
-from .imaging import Recipe, prepare, tiles
+from .imaging import Recipe
+from .dataset import stage_dataset, training_settings
 
 
 def atomic_json(path, data):
@@ -19,59 +18,43 @@ def atomic_json(path, data):
 
 
 def train(job):
+    root = Path(job['run']).resolve()
+    recipe = Recipe(**job['recipe'])
+    settings = training_settings(job)
+    if settings['quick_check']:
+        print('QUICK CHECK: 1 epoch with bounded representative tiles. '
+              'This checks training/inference plumbing, not defect accuracy.', flush=True)
+    sampling = stage_dataset(root, Path(job['dataset']).resolve(), recipe,
+                             settings['train_tile_budget'], settings['validation_tile_budget'])
+    atomic_json(root/'sampling.json', sampling)
+    source_shape = sampling['source_shape']
+    source_splits = sampling['splits']
     import torch
     from lightning import seed_everything
+    from lightning.pytorch.callbacks import Callback
     from anomalib.data import Folder
     from anomalib.models import EfficientAd, Patchcore
     from anomalib.engine import Engine
     seed_everything(42,workers=True)
     torch.set_num_threads(min(8,os.cpu_count() or 1))
-    root = Path(job['run'])
-    recipe = Recipe(**job['recipe'])
-    dataset = Path(job['dataset']).resolve()
-    files = sorted(p for p in dataset.rglob('*') if p.suffix.lower() in {'.png','.jpg','.jpeg','.bmp','.tif','.tiff'} and p.is_file())
-    if len(files)>2000:
-        raise ValueError('Maximum 2000 source images per run; curate a representative dataset first')
-    # Deduplicate before splitting: repeated camera captures must not leak to validation.
-    unique = {}
-    for p in files:
-        digest = hashlib.sha256(p.read_bytes()).hexdigest()
-        unique.setdefault(digest,p)
-    files = list(unique.values())
-    if len(files)<30:
-        raise ValueError('At least 30 distinct good images are required (100–500 recommended)')
-    random.Random(42).shuffle(files)
-    nval = max(6,len(files)//5)
-    splits = {'validation':files[:nval], 'normal':files[nval:]}
-    source_shape = None
-    for name,paths in splits.items():
-        target = root/'dataset'/name
-        target.mkdir(parents=True)
-        total = 0
-        for i,p in enumerate(paths):
-            frame = cv2.imread(str(p))
-            if frame is None:
-                raise ValueError(f'Unreadable image: {p.name}')
-            if source_shape is None:
-                source_shape = list(frame.shape[:2])
-            if list(frame.shape[:2]) != source_shape:
-                raise ValueError('All source images must have the same camera resolution')
-            image,glare,_ = prepare(frame,recipe)
-            if glare.mean()>recipe.max_glare:
-                raise ValueError(f'Excess glare in {p.name}; recapture under controlled lighting')
-            for j,(_,tile) in enumerate(tiles(image,recipe)):
-                total += 1
-                if total>4000:
-                    raise ValueError('More than 4000 tiles per split; reduce dataset or narrow ROI')
-                if not cv2.imwrite(str(target/f'{i:05}_{j:03}.png'),tile):
-                    raise OSError('Could not write staged training image')
+
+    class Progress(Callback):
+        def on_train_epoch_start(self, trainer, pl_module):
+            print(f'{pl_module.__class__.__name__}: epoch {trainer.current_epoch+1}/{trainer.max_epochs}', flush=True)
+
+        def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
+            completed = batch_idx+1
+            if completed % 25 == 0 or completed == trainer.num_training_batches:
+                print(f'{pl_module.__class__.__name__}: epoch {trainer.current_epoch+1}, '
+                      f'tile {completed}/{trainer.num_training_batches}', flush=True)
+
     assets = root.parent/'assets'
     assets.mkdir(exist_ok=True)
     # anomalib stores its teacher cache relative to cwd; keep it out of source.
     os.chdir(assets)
     torch.hub.set_dir(str(assets/'torch'))
     models = [EfficientAd(imagenet_dir=str(root.parent/'assets'/'imagenette'),post_processor=False,evaluator=False,visualizer=False),
-              Patchcore(backbone='resnet18',layers=['layer2','layer3'],pre_trained=False,coreset_sampling_ratio=job['coreset'],
+              Patchcore(backbone='resnet18',layers=['layer2','layer3'],pre_trained=False,coreset_sampling_ratio=settings['coreset'],
                         pre_processor=Patchcore.configure_pre_processor(image_size=(256,256),center_crop_size=(256,256)),
                         post_processor=False,evaluator=False,visualizer=False)]
     # Use official, hash-checked torchvision ResNet18 weights with the equivalent
@@ -88,13 +71,21 @@ def train(job):
         dm = Folder(name='part',root=root/'dataset',normal_dir='normal',normal_test_dir='validation',
                     normal_split_ratio=0,train_batch_size=1,eval_batch_size=1,num_workers=0,
                     val_split_mode='same_as_test',seed=42)
-        engine = Engine(default_root_dir=root/name.replace('.ckpt',''),max_epochs=1 if name=='patchcore.ckpt' else job['epochs'],
-                        accelerator='auto',devices=1,logger=False,enable_progress_bar=False)
+        engine = Engine(default_root_dir=root/name.replace('.ckpt',''),max_epochs=1 if name=='patchcore.ckpt' else settings['epochs'],
+                        accelerator='auto',devices=1,logger=False,enable_progress_bar=False,callbacks=[Progress()])
         engine.fit(model=model,datamodule=dm)
         engine.trainer.save_checkpoint(root/name)
         model.cpu().eval()
+        # anomalib retains collected PatchCore embeddings after coreset fitting.
+        # They are plain-list tensors and are not moved by .cpu().
+        if isinstance(model, Patchcore):
+            model.embeddings.clear()
+        del engine, dm
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
     # Calibrate each raw model map on untouched good source images, separate from training.
     calibration = []
+    print('Calibrating both models on held-out source tiles', flush=True)
     for model in models:
         samples = []
         with torch.inference_mode():
@@ -108,14 +99,20 @@ def train(job):
         if not np.isfinite(values).all() or upper-median<1e-9:
             raise ValueError('Degenerate calibration: model maps do not distinguish normal variation')
         calibration.append({'median':float(median),'upper':float(upper)})
-    manifest = {'format':1,'recipe':recipe.dict(),'source_shape':source_shape,'calibration':calibration,'normal_sources':len(files)-nval,
-                'validation_sources':nval,'epochs':job['epochs'],'models':['EfficientAd-small','Patchcore-resnet18'],
+    manifest = {'format':1,'recipe':recipe.dict(),'source_shape':source_shape,'calibration':calibration,'normal_sources':source_splits['normal']['available_sources'],
+                'validation_sources':source_splits['validation']['available_sources'],'epochs':settings['epochs'],
+                'quick_check':settings['quick_check'],
+                'tile_sampling':{name:{key:value for key,value in split.items() if key!='sources'}
+                                 for name,split in source_splits.items()},'models':['EfficientAd-small','Patchcore-resnet18'],
                 'threshold_note':'Normal-only pixel quantiles; validate with real defects before production acceptance.'}
     atomic_json(root/'manifest.json',manifest)
     # Publish only after checkpoints can be loaded and a real prediction succeeds.
     from .model import Hybrid
     hybrid = Hybrid(root,device='cpu')
-    score,_,_ = hybrid.predict(cv2.imread(str(files[0])))
+    sample_path = next(root.glob('dataset/normal/*.png'))
+    sample_frame = cv2.imread(str(sample_path))
+    maps = hybrid.tile_maps(sample_frame)
+    score = np.maximum(maps[0], maps[1])
     if not np.isfinite(score).all():
         raise ValueError('Non-finite hybrid prediction')
     atomic_json(root.parent/'active.json',{'run':root.name})

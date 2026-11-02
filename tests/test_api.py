@@ -63,3 +63,45 @@ def test_stale_capture_is_not_reported_as_current_normal(app,monkeypatch):
     result=client.get('/api/status').json()['result']
     assert result['decision']=='STALE — WAIT FOR INFERENCE'
     assert result['frame_age_ms']>9000
+
+
+def test_quick_check_dispatches_bounded_job_without_polluting_recipe(app,monkeypatch):
+    import json
+    from types import SimpleNamespace
+    client,module=app
+    for i in range(30):
+        cv2.imwrite(str(module.DATA/'captures'/f'{i}.png'), np.full((32,32,3),40+i,np.uint8))
+    monkeypatch.setattr(module.importlib.util,'find_spec',lambda _:True)
+    calls=[]
+    def fake_process(command,**kwargs):
+        calls.append(command)
+        return SimpleNamespace(poll=lambda:0)
+    monkeypatch.setattr(module.subprocess,'Popen',fake_process)
+    response=client.post('/api/train',json={'quick_check':True,'epochs':100,'coreset':.05,
+                                         'train_tile_budget':1024,'validation_tile_budget':512})
+    assert response.status_code==200,response.text
+    result=response.json()
+    assert result['epochs']==1 and result['coreset']==.001
+    job=json.loads((module.current_run/'job.json').read_text())
+    assert job['train_tile_budget']==128 and job['validation_tile_budget']==64
+    assert job['quick_check'] is True
+    assert not {'quick_check','train_tile_budget','validation_tile_budget'} & set(job['recipe'])
+    assert calls[0][1:4]==['-u','-m','pead.train']
+    assert not (module.DATA/'models'/'active.json').exists()
+
+
+def test_invalid_training_budget_rejected_before_creating_run(app):
+    client,module=app
+    for data in [{'train_tile_budget':4000},{'validation_tile_budget':0}]:
+        assert client.post('/api/train',json=data).status_code==422
+    assert not list((module.DATA/'models').iterdir())
+
+
+def test_status_labels_quick_check_model_even_before_loading_it(app):
+    import json
+    client,module=app
+    run=module.DATA/'models'/'quick'
+    run.mkdir()
+    (run/'manifest.json').write_text(json.dumps({'quick_check':True}))
+    (module.DATA/'models'/'active.json').write_text(json.dumps({'run':'quick'}))
+    assert client.get('/api/status').json()['model_quick_check'] is True

@@ -30,13 +30,17 @@ class Hybrid:
         with self.torch.inference_mode():
             return [m(tensor).anomaly_map.squeeze().cpu().numpy() for m in self.models]
 
-    def predict(self, frame):
+    def predict(self, frame, cancel=None):
         if list(frame.shape[:2]) != self.meta['source_shape']:
             raise ValueError('Camera resolution differs from training; restore the trained capture profile or retrain')
         image,glare,box = prepare(frame,self.recipe)
         fused = np.zeros(image.shape[:2],np.float32)
         for (x,y,x1,y1),tile in tiles(image,self.recipe):
+            if cancel is not None and cancel():
+                raise InterruptedError('Inspection stopped')
             maps = self.tile_maps(tile)
+            if cancel is not None and cancel():
+                raise InterruptedError('Inspection stopped')
             if any(not np.isfinite(raw).all() for raw in maps):
                 raise ValueError('Model produced non-finite anomaly scores; inspection stopped')
             normalized = []

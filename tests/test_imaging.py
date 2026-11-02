@@ -49,3 +49,12 @@ def test_doubtful_and_normal_use_fixed_thresholds():
     for value,decision in [(.1,'NORMAL'),(.8,'REVIEW'),(1.2,'ANOMALY')]:
         _,result=overlay(frame,np.full((50,50),value,np.float32),glare,box,recipe)
         assert result['decision']==decision
+
+
+def test_inference_can_be_cancelled_before_processing_a_tile():
+    from pead.model import Hybrid
+    model=Hybrid.__new__(Hybrid)
+    model.recipe=Recipe()
+    model.meta={'source_shape':[64,64]}
+    with pytest.raises(InterruptedError,match='stopped'):
+        model.predict(np.full((64,64,3),80,np.uint8),cancel=lambda:True)

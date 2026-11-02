@@ -20,6 +20,8 @@ from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from .camera import Camera
 from .imaging import Recipe, overlay, prepare
+from .dataset import (DEFAULT_TRAIN_TILES, DEFAULT_VALIDATION_TILES, MAX_TRAIN_TILES,
+                      MAX_VALIDATION_TILES, training_settings)
 from .train import atomic_json
 
 DATA = Path(os.environ.get('PEAD_DATA_DIR','data')).resolve()
@@ -59,7 +61,7 @@ def inspect_loop():
                 continue
             state['processing'] = True
         try:
-            score,glare,box = model.predict(frame)
+            score,glare,box = model.predict(frame,cancel=lambda:shutdown.is_set() or not state['inspection'])
             image,result = overlay(frame,score,glare,box,model.recipe)
             elapsed = (time.monotonic()-start)*1000
             # Drop output from a previous camera/model/inspection session.
@@ -71,6 +73,8 @@ def inspect_loop():
                 state.update(result=result,jpeg=encode(image),error=None,inference_ms=elapsed)
             with (DATA/'inspection.jsonl').open('a') as f:
                 f.write(json.dumps(result)+'\n')
+        except InterruptedError:
+            pass
         except Exception as exc:
             with state_lock:
                 state.update(error=str(exc),inspection=False,result=None,jpeg=None)
@@ -106,7 +110,9 @@ async def lifespan(app):
         camera.stop()
     except RuntimeError:
         pass
-    thread.join(timeout=5)
+    # A stop request interrupts inference between tiles, instead of leaving a
+    # daemon thread in PyTorch while Python tears down the process.
+    thread.join(timeout=30)
     if log_handle:
         log_handle.close()
 
@@ -175,10 +181,17 @@ def status():
             if age>2:
                 result['decision'] = 'STALE — WAIT FOR INFERENCE'
         active = DATA/'models'/'active.json'
+        available_run = json.loads(active.read_text())['run'] if active.exists() else None
+        if state['model'] is not None:
+            model_quick_check = state['model'].meta.get('quick_check',False)
+        elif available_run and (DATA/'models'/available_run/'manifest.json').exists():
+            model_quick_check = json.loads((DATA/'models'/available_run/'manifest.json').read_text()).get('quick_check',False)
+        else:
+            model_quick_check = False
         return {'camera':{'connected':frame is not None,'error':camera.error,'actual':camera.actual},
                 'inspection':state['inspection'],'result':result,'error':state['error'],
                 'inference_ms':state['inference_ms'],'model':state['run'],
-                'available_model':json.loads(active.read_text())['run'] if active.exists() else None,
+                'available_model':available_run,'model_quick_check':model_quick_check,
                 'ml_installed':importlib.util.find_spec('anomalib') is not None,
                 'captures':len(list((DATA/'captures').glob('*.png'))),'capture_folder':str(DATA/'captures'),
                 'training':job_status()}
@@ -245,6 +258,9 @@ class TrainingConfig(BaseModel):
     dataset: str = ''
     epochs: int = Field(default=100,ge=1,le=1000)
     coreset: float = Field(default=.01,ge=.001,le=.1)
+    train_tile_budget: int = Field(default=DEFAULT_TRAIN_TILES,ge=24,le=MAX_TRAIN_TILES)
+    validation_tile_budget: int = Field(default=DEFAULT_VALIDATION_TILES,ge=6,le=MAX_VALIDATION_TILES)
+    quick_check: bool = False
     roi: tuple[float,float,float,float] = (0,0,1,1)
     clahe: bool = False
     glare_level: int = 248
@@ -262,7 +278,9 @@ def start_training(config: TrainingConfig):
         if importlib.util.find_spec('anomalib') is None:
             raise HTTPException(409,'ML dependencies missing. Follow the installation instructions in README.md.')
         try:
-            recipe = Recipe(**config.model_dump(exclude={'dataset','epochs','coreset'}))
+            recipe = Recipe(**config.model_dump(exclude={'dataset','epochs','coreset','train_tile_budget',
+                                                        'validation_tile_budget','quick_check'}))
+            settings = training_settings(config.model_dump())
         except ValueError as exc:
             raise HTTPException(422,str(exc)) from exc
         dataset = Path(config.dataset).expanduser().resolve() if config.dataset else DATA/'captures'
@@ -273,7 +291,7 @@ def start_training(config: TrainingConfig):
             raise HTTPException(422,'Select 30–2000 good images; duplicates are rejected during training')
         current_run = DATA/'models'/datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S_%f')
         current_run.mkdir()
-        job = {'dataset':str(dataset),'run':str(current_run),'recipe':recipe.dict(),'epochs':config.epochs,'coreset':config.coreset}
+        job = {'dataset':str(dataset),'run':str(current_run),'recipe':recipe.dict(),**settings}
         atomic_json(current_run/'job.json',job)
         if log_handle:
             log_handle.close()
@@ -286,8 +304,8 @@ def start_training(config: TrainingConfig):
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
         state.update(model=None,run=None,jpeg=None,result=None,error=None)
-        process = subprocess.Popen([sys.executable,'-m','pead.train',str(current_run/'job.json')],stdout=log_handle,stderr=subprocess.STDOUT)
-    return {'state':'running','run':current_run.name}
+        process = subprocess.Popen([sys.executable,'-u','-m','pead.train',str(current_run/'job.json')],stdout=log_handle,stderr=subprocess.STDOUT)
+    return {'state':'running','run':current_run.name,**settings}
 
 
 @app.get('/api/train/log')
