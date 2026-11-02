@@ -108,3 +108,14 @@ def test_legacy_models_request_retraining_without_loading_pickle(tmp_path,monkey
     monkeypatch.setattr(EfficientAd,'load_from_checkpoint',never)
     with pytest.raises(ValueError,match='older checkpoint format.*Retrain'):
         Hybrid(tmp_path)
+
+
+def test_model_assets_use_short_launcher_cache_without_moving_data(tmp_path,monkeypatch):
+    from pead.train import model_assets_dir
+    run=tmp_path/'deep-checkout'/'data'/'models'/'run'
+    monkeypatch.delenv('PEAD_ASSETS_DIR',raising=False)
+    assert model_assets_dir(run)==run.parent/'assets'
+    external=tmp_path/'short-assets'
+    monkeypatch.setenv('PEAD_ASSETS_DIR',str(external))
+    assert model_assets_dir(run)==external
+    assert not run.exists() and not external.exists()

@@ -18,6 +18,11 @@ def atomic_json(path, data):
     os.replace(temp,path)
 
 
+def model_assets_dir(run_root):
+    """Windows launchers supply a short cache; other workflows keep their cache."""
+    return Path(os.environ.get('PEAD_ASSETS_DIR', str(Path(run_root).parent/'assets'))).expanduser().resolve()
+
+
 def calibration_values(raw, mask_path, required=False):
     """Select only inspectable part pixels from a staged held-out tile."""
     mask_path = Path(mask_path)
@@ -65,12 +70,13 @@ def train(job):
                 print(f'{pl_module.__class__.__name__}: epoch {trainer.current_epoch+1}, '
                       f'tile {completed}/{trainer.num_training_batches}', flush=True)
 
-    assets = root.parent/'assets'
-    assets.mkdir(exist_ok=True)
+    assets = model_assets_dir(root)
+    assets.mkdir(parents=True, exist_ok=True)
+    print(f'Model assets: {assets}',flush=True)
     # anomalib stores its teacher cache relative to cwd; keep it out of source.
     os.chdir(assets)
     torch.hub.set_dir(str(assets/'torch'))
-    models = [EfficientAd(imagenet_dir=str(root.parent/'assets'/'imagenette'),post_processor=False,evaluator=False,visualizer=False),
+    models = [EfficientAd(imagenet_dir=str(assets/'imagenette'),post_processor=False,evaluator=False,visualizer=False),
               Patchcore(backbone='resnet18',layers=['layer2','layer3'],pre_trained=False,coreset_sampling_ratio=settings['coreset'],
                         pre_processor=Patchcore.configure_pre_processor(image_size=(256,256),center_crop_size=(256,256)),
                         post_processor=False,evaluator=False,visualizer=False)]

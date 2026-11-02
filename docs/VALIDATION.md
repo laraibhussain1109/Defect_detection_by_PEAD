@@ -59,3 +59,21 @@ Validated in a clean **CPython 3.13.16** environment:
 - JavaScript syntax and whitespace checks passed. PowerShell scripts were reviewed, not executed on Windows; physical Windows/CUDA/camera behavior and real defect recall remain target-workstation checks.
 
 Checkpoint format 2 uses the updated stack's safe plain-data component configuration. Format 1 model files are retained but require retraining; dataset/source images are not modified or removed. The synthetic penalty-image fixture is test-only, as in prior integration checks.
+
+## Windows long-path installer recovery (0.2.1)
+
+The reported package-install failure occurred under a 153-character checkout root. The installer had put `.venv` under that root, so setuptools' nested package files exceeded the legacy Windows path limit. Installation stopped before the required anomalib version could be installed.
+
+The installer and launcher now share `scripts/windows-paths.ps1`. Dependencies live under `%USERPROFILE%\.pead\v\<project-id>`, not inside the checkout. Temporary wheel builds and model assets use short runtime paths too; an already-existing short pip cache is reused to avoid re-downloading large wheels. Existing local `.venv` files and all source images remain untouched. Incomplete managed environments are preserved before rebuilding.
+
+A readiness marker is written only after package installation, `pip check`, and actual model imports succeed. The launcher checks that marker's project and dependency hash and refuses incomplete installations; it never falls back to checkout-local or global Python.
+
+Validation:
+
+- Executed the actual installer, shared resolver, and launcher under **PowerShell 7.4.6** on Linux, using isolated Python/pip command fixtures, with **53 passing assertions**. PowerShell itself was downloaded from its official release and checked against the published SHA256 before use.
+- The harness runs from a checkout at least 153 characters long and reconstructs the reported setuptools suffix: the old checkout-local target exceeds 260 characters; the managed target stays below it. It verifies matching install/start interpreter paths, source/partial-environment preservation, cache reuse, overrides, manifest changes, and path guards.
+- Injected failures at PyTorch installation, application dependency installation, dependency verification, and runtime imports. Each failure revoked readiness and prevented server launch; repair completed and restored readiness.
+- Inspected the actual Windows CPython 3.13 PyTorch 2.10.0 CUDA wheel. Its longest package member is 119 characters; with the default short runtime path for the reported user profile, the installed target is approximately 172 characters.
+- Python regressions also exercise the external model-assets override without moving dataset/run paths. Dependency consistency, JavaScript syntax, and whitespace checks passed.
+
+These are real PowerShell script-execution tests with controlled native-command fixtures and Windows-wheel path analysis. They do not claim an actual pip/CUDA installation on Windows or execution on the user's physical PC. The repair avoids the known long-path source rather than changing Windows registry policy.

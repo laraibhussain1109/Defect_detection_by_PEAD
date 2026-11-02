@@ -29,12 +29,12 @@ def validate_runtime(require_ml=True, version_info=None):
             except metadata.PackageNotFoundError as exc:
                 raise RuntimeError(
                     f'Missing {package}. Run `{INSTALL_COMMAND}`, then scripts/start.ps1 '
-                    'to use the project .venv.'
+                    'to use the managed PEAD environment.'
                 ) from exc
             if actual.split('+', 1)[0] != expected:
                 raise RuntimeError(
                     f'Unsupported {package} {actual}; this application requires {package}=={expected}. '
-                    f'Run `{INSTALL_COMMAND}`, then scripts/start.ps1 to use the updated project .venv.'
+                    f'Run `{INSTALL_COMMAND}`, then scripts/start.ps1 to use the updated managed PEAD environment.'
                 )
             versions[package] = actual
     return {'python': f'{version[0]}.{version[1]}', 'executable': sys.executable, 'versions': versions}

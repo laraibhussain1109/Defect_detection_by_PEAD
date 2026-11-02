@@ -30,7 +30,7 @@ Python **3.11–3.13** is supported. Version 0.2 uses anomalib 2.7.0, PyTorch 2.
 
 `WinError 1314` in anomalib's workspace setup was caused by a directory symlink requiring a Windows privilege. Training now uses ordinary run-specific directories and does not require administrator rights or Developer Mode for symlinks.
 
-Python **3.13 is supported** by the updated stack; no Python 3.11 downgrade is needed. Stop the app, replace the application files while keeping your `data` folder and source images, then rerun the installation and startup commands above. The installer prefers `py -3.13`, then Python 3.12 or 3.11, with a supported `python` on PATH as a fallback. It creates the project `.venv` instead of modifying global packages. An incompatible old environment is preserved in a `.venv-backup-*` folder. The launcher validates the local interpreter and pinned core dependencies before startup.
+Python **3.13 is supported** by the updated stack; no Python 3.11 downgrade is needed. Stop the app, replace the application files while keeping your `data` folder and source images, then rerun the installation and startup commands above. The installer prefers `py -3.13`, then Python 3.12 or 3.11, with a supported `python` on PATH as a fallback. It installs packages outside the checkout at `%USERPROFILE%\.pead\v\<project-id>` instead of modifying global packages or using the checkout-local `.venv`. The project ID is a stable hash of this checkout's full path, so installation and startup resolve the same interpreter even when you run them from another working directory. Existing `.venv` files are left untouched and ignored. The launcher validates the managed interpreter and pinned dependencies before startup.
 
 The installer normally installs the CUDA 12.6 PyTorch wheels. For a CPU-only workstation, use:
 
@@ -38,7 +38,17 @@ The installer normally installs the CUDA 12.6 PyTorch wheels. For a CPU-only wor
 powershell -ExecutionPolicy Bypass -File scripts/install-windows.ps1 -Cpu
 ```
 
-To rebuild an existing environment explicitly, add `-Recreate`; this preserves the old `.venv` as a backup. Neither option deletes datasets or model caches.
+To rebuild the managed environment explicitly, add `-Recreate`; the previous managed environment is renamed to a short backup sibling. Neither option deletes datasets or model caches.
+
+### Windows long-path installation recovery
+
+A nested GitHub ZIP directory can make package paths exceed Windows' legacy path limit, producing `WinError 3` or a pip long-path hint. The installer now keeps the environment, pip cache, temporary wheel builds, and model downloads under a short, user-writable `%USERPROFILE%\.pead` root. No administrator privilege or Windows long-path registry change is required. Your checkout, source images, and `data` directory remain in place.
+
+Stop any old app terminal with Ctrl+C before upgrading. Replace the application files, rerun `scripts/install-windows.ps1`, and wait for **INSTALLATION COMPLETE**. Only then run `scripts/start.ps1`. Do not start the app through global `python -m uvicorn` or the old checkout `.venv`: that can run an unrelated anomalib version after a failed install.
+
+Installation and startup share `scripts/windows-paths.ps1`. Successful installation writes a project/dependency-checked readiness marker after pip, dependency consistency, and actual model-import checks. A failed or interrupted installation has no valid marker, so the launcher refuses to start. Re-running the installer preserves an incomplete managed environment before rebuilding it.
+
+For an unusually deep user profile, set `PEAD_RUNTIME_ROOT` to a **short, absolute, user-writable directory** before both commands. Managed environment paths longer than 80 characters are rejected before package installation. `PEAD_ASSETS_DIR` controls the model-download directory; the Windows launcher defaults it to the short runtime cache. Application captures, run artifacts, and logs remain in `data` unless you explicitly set `PEAD_DATA_DIR`.
 
 Version 0.2 writes checkpoint format 2 with plain component configuration and uses `weights_only=True` when loading. **Retrain models saved by earlier releases** before using them with this version: older format-1 checkpoints are rejected with a retraining message. Your good images remain usable. Keep the old run folders if you need to retain the previous artifacts; a newly verified run activates its own model pair.
 
